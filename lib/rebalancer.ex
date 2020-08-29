@@ -28,6 +28,7 @@ defmodule Rebalancer do
     :credentials,
     :coins,
     :stake,
+    :stake_exposure,
     :threshold,
     :exchange_infos,
     :balances,
@@ -43,6 +44,7 @@ defmodule Rebalancer do
 
   def rebalance() do
     Logger.info("Start rebalancing")
+
     %__MODULE__{}
     |> get_config()
     |> get_credentials()
@@ -54,6 +56,7 @@ defmodule Rebalancer do
     |> target()
     |> thresholds()
     |> execute()
+
     Logger.info("Done rebalancing")
   end
 
@@ -65,6 +68,7 @@ defmodule Rebalancer do
       state
       | coins: coins,
         stake: Application.get_env(:rebalancer, :stake),
+        stake_exposure: Application.get_env(:rebalancer, :stake_exposure),
         threshold: Application.get_env(:rebalancer, :threshold) |> D.new()
     }
   end
@@ -84,7 +88,9 @@ defmodule Rebalancer do
   end
 
   def cancel_all_orders(%{coins: coins, stake: stake, credentials: credentials} = state) do
-    Enum.each(coins, fn coin ->
+    coins
+    |> Map.keys()
+    |> Enum.each(fn coin ->
       ExBinance.Private.cancel_all_orders(coin <> stake, credentials)
     end)
 
@@ -94,9 +100,11 @@ defmodule Rebalancer do
   def get_balances(%{credentials: credentials, coins: coins, stake: stake} = state) do
     {:ok, %{balances: balances}} = ExBinance.Private.account(credentials)
 
+    coins_name = Map.keys(coins)
+
     balances =
       balances
-      |> Enum.filter(&(&1["asset"] in coins or &1["asset"] == stake))
+      |> Enum.filter(&(&1["asset"] in coins_name or &1["asset"] == stake))
 
     %{state | balances: balances}
   end
@@ -117,6 +125,10 @@ defmodule Rebalancer do
     %{state | balances: balances}
   end
 
+  @spec total_balance(%{balances: any, total_balance: any}) :: %{
+          balances: any,
+          total_balance: any
+        }
   def total_balance(%{balances: balances} = state) do
     total_balance =
       Enum.reduce(balances, D.new(0), fn %{"free" => free}, acc ->
@@ -126,10 +138,18 @@ defmodule Rebalancer do
     %{state | total_balance: total_balance}
   end
 
-  def target(%{total_balance: total_balance, balances: balances} = state) do
-    target =
-      total_balance
-      |> D.div(length(balances))
+  @spec target(%{balances: [any], target: any, total_balance: binary | integer | Decimal.t()}) ::
+          %{balances: [any], target: Decimal.t(), total_balance: binary | integer | Decimal.t()}
+  def target(
+        %{total_balance: total_balance, coins: coins, stake_exposure: stake_exposure} = state
+      ) do
+    div =
+      coins
+      |> Map.values()
+      |> Enum.sum()
+      |> Kernel.+(stake_exposure)
+
+    target = D.div(total_balance, div)
 
     %{state | target: target}
   end
@@ -157,7 +177,7 @@ defmodule Rebalancer do
         sell_threshold: sell_threshold,
         buy_threshold: buy_threshold
       }) do
-    Enum.each(coins, fn symbol ->
+    Enum.each(coins, fn {symbol, exposure} ->
       %{"free" => free, "avg_price" => avg_price} = get_balance(balances, symbol)
 
       %{"baseAssetPrecision" => precision, "filters" => filters} =
@@ -167,6 +187,10 @@ defmodule Rebalancer do
       price_filter = Enum.find(filters, &(&1["filterType"] == "PRICE_FILTER"))
 
       D.with_context(%{D.get_context() | precision: precision}, fn ->
+        buy_threshold = D.mult(buy_threshold, exposure)
+        sell_threshold = D.mult(sell_threshold, exposure)
+        target = D.mult(target, exposure)
+
         cond do
           D.cmp(free, buy_threshold) == :lt ->
             buy(symbol, stake, target, free, avg_price, lot_size, price_filter, credentials)
